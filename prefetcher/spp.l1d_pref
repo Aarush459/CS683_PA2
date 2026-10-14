@@ -1,24 +1,308 @@
 #include "cache.h"
 
+// Stride Pattern Prefetcher (SPP) for the L1D.
+//
+// Every load IP gets an entry in a small IP table. If the IP keeps repeating
+// the same stride we prefetch along that stride (uniform mode). If it doesn't,
+// we fall back to a signature of its recent strides and look up the stride
+// that usually follows it in a shared pattern table (non-uniform mode).
+// A small filter of recently prefetched lines measures accuracy, and the
+// degree is re-picked from that accuracy every WINDOW prefetches.
 
-void CACHE::l1d_prefetcher_initialize() 
+#define IT_SIZE          32     // IP table entries, fully associative with LRU
+#define IP_TAG_BITS      12
+#define PAGE_TAG_BITS    16
+
+#define SIG_BITS         9      // signature covers roughly the last 3 strides
+#define SIG_SHIFT        3
+#define PT_SIZE          (1 << SIG_BITS)
+
+#define CONF_MAX         3      // all confidence counters are 2 bits
+#define PT_THRESHOLD     2      // pattern table confidence needed to prefetch
+
+#define FILTER_SIZE      128
+#define FILTER_TAG_BITS  12
+
+#define WINDOW           256    // prefetches between degree updates
+#define MAX_DEGREE       4
+#define ACC_HIGH         75     // accuracy thresholds in percent
+#define ACC_MID          50
+#define ACC_LOW          25
+
+#define OFFSET_BITS      (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)   // 64 lines in a 4 KB page
+#define OFFSET_MASK      ((1 << OFFSET_BITS) - 1)
+
+struct IPEntry {
+    bool valid = false;
+    uint16_t tag = 0;
+    uint16_t page = 0;
+    uint8_t offset = 0;      // line offset of the last access within its page
+    int8_t stride = 0;       // last stride seen, in cache lines
+    uint8_t conf = 0;        // how confident we are that the stride is uniform
+    uint16_t sig = 0;        // history of recent strides
+    uint8_t lru = 0;
+};
+
+struct PTEntry {
+    int8_t stride = 0;       // stride that usually follows this signature
+    uint8_t conf = 0;
+};
+
+struct FilterEntry {
+    bool valid = false;
+    uint16_t tag = 0;
+};
+
+static IPEntry ip_table[IT_SIZE];
+static PTEntry pattern_table[PT_SIZE];
+static FilterEntry pf_filter[FILTER_SIZE];
+
+static int degree = 2;
+static uint32_t window_issued = 0;
+static uint32_t window_useful = 0;
+
+// Only used for printing at the end of the run
+static uint64_t total_issued = 0, total_useful = 0;
+static uint64_t uniform_issued = 0, pattern_issued = 0;
+static uint64_t windows_at_degree[MAX_DEGREE + 1] = {0};
+
+
+static uint16_t hash_ip(uint64_t ip)
+{
+    // Fold the upper bits in instead of just masking, so IPs that share
+    // their low bits don't all land on the same tag.
+    return (ip ^ (ip >> IP_TAG_BITS) ^ (ip >> (2 * IP_TAG_BITS))) & ((1 << IP_TAG_BITS) - 1);
+}
+
+static uint16_t next_signature(uint16_t sig, int stride)
+{
+    return ((sig << SIG_SHIFT) ^ (stride & 0x7F)) & (PT_SIZE - 1);
+}
+
+static void increase(uint8_t &counter) { if (counter < CONF_MAX) counter++; }
+static void decrease(uint8_t &counter) { if (counter > 0) counter--; }
+
+static bool same_page(uint64_t line_a, uint64_t line_b)
+{
+    return (line_a >> OFFSET_BITS) == (line_b >> OFFSET_BITS);
+}
+
+
+// The filter is a tiny direct-mapped tag array of lines we prefetched recently.
+// A demand hit in it means the prefetch was useful. It also stops us from
+// asking for the same line again while it is still on its way.
+static uint16_t filter_tag(uint64_t line)
+{
+    return (line / FILTER_SIZE) & ((1 << FILTER_TAG_BITS) - 1);
+}
+
+static bool in_filter(uint64_t line)
+{
+    FilterEntry &f = pf_filter[line % FILTER_SIZE];
+    return f.valid && f.tag == filter_tag(line);
+}
+
+static void add_to_filter(uint64_t line)
+{
+    FilterEntry &f = pf_filter[line % FILTER_SIZE];
+    f.valid = true;
+    f.tag = filter_tag(line);
+}
+
+static void remove_from_filter(uint64_t line)
+{
+    pf_filter[line % FILTER_SIZE].valid = false;
+}
+
+
+static void update_degree()
+{
+    int accuracy = 100 * window_useful / window_issued;
+
+    if (accuracy >= ACC_HIGH)
+        degree = 4;
+    else if (accuracy >= ACC_MID)
+        degree = 3;
+    else if (accuracy >= ACC_LOW)
+        degree = 2;
+    else
+        degree = 1;
+
+    windows_at_degree[degree]++;
+    window_issued = 0;
+    window_useful = 0;
+}
+
+// Returns false only when the prefetch queue is full, so the caller stops early.
+static bool issue(CACHE *cache, uint64_t ip, uint64_t addr, uint64_t pf_line, uint64_t &mode_count)
+{
+    if (in_filter(pf_line))
+        return true;
+
+    // Same rule as the IP-stride prefetcher: fill into L1 only if the MSHRs aren't busy
+    int fill_level = (cache->MSHR.occupancy < cache->MSHR.SIZE / 2) ? FILL_L1 : FILL_L2;
+
+    if (!cache->prefetch_line(ip, addr, pf_line << LOG2_BLOCK_SIZE, fill_level, 0))
+        return false;
+
+    add_to_filter(pf_line);
+    mode_count++;
+    total_issued++;
+
+    if (++window_issued == WINDOW)
+        update_degree();
+    return true;
+}
+
+
+static int find_entry(uint16_t tag)
+{
+    for (int i = 0; i < IT_SIZE; i++)
+        if (ip_table[i].valid && ip_table[i].tag == tag)
+            return i;
+    return -1;
+}
+
+static void make_mru(int index)
+{
+    for (int i = 0; i < IT_SIZE; i++)
+        if (ip_table[i].lru < ip_table[index].lru)
+            ip_table[i].lru++;
+    ip_table[index].lru = 0;
+}
+
+static int ip_table_victim()
+{
+    for (int i = 0; i < IT_SIZE; i++)
+        if (ip_table[i].lru == IT_SIZE - 1)
+            return i;
+    return 0;
+}
+
+
+void CACHE::l1d_prefetcher_initialize()
 {
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << " Stride Pattern Prefetcher (SPP) " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "IP table " << IT_SIZE << " entries, pattern table " << PT_SIZE
+              << " entries, filter " << FILTER_SIZE << " entries, window " << WINDOW << std::endl;
+
+    for (int i = 0; i < IT_SIZE; i++)
+        ip_table[i].lru = i;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t line = addr >> LOG2_BLOCK_SIZE;
+    uint16_t page = (line >> OFFSET_BITS) & ((1 << PAGE_TAG_BITS) - 1);
+    uint8_t offset = line & OFFSET_MASK;
+
+    // Demand access to a line we prefetched: that prefetch was useful
+    if (in_filter(line)) {
+        remove_from_filter(line);
+        window_useful++;
+        total_useful++;
+    }
+
+    uint16_t tag = hash_ip(ip);
+    int index = find_entry(tag);
+
+    if (index < 0) {
+        index = ip_table_victim();
+        IPEntry &fresh = ip_table[index];
+        fresh.valid = true;
+        fresh.tag = tag;
+        fresh.page = page;
+        fresh.offset = offset;
+        fresh.stride = 0;
+        fresh.conf = 0;
+        fresh.sig = 0;
+        make_mru(index);
+        return;
+    }
+
+    IPEntry &entry = ip_table[index];
+    make_mru(index);
+
+    // Strides are only measured inside a page. When the IP moves to a new page
+    // we keep what it has learned and just restart from the new position.
+    if (entry.page != page) {
+        entry.page = page;
+        entry.offset = offset;
+        return;
+    }
+
+    int stride = (int)offset - (int)entry.offset;
+    if (stride == 0)
+        return;
+
+    // Teach the pattern table which stride followed the old signature.
+    // A wrong entry has to lose its confidence before it gets replaced.
+    PTEntry &learned = pattern_table[entry.sig];
+    if (learned.stride == stride)
+        increase(learned.conf);
+    else if (learned.conf > 0)
+        decrease(learned.conf);
+    else {
+        learned.stride = stride;
+        learned.conf = 1;
+    }
+
+    if (stride == entry.stride)
+        increase(entry.conf);
+    else
+        decrease(entry.conf);
+
+    entry.stride = stride;
+    entry.sig = next_signature(entry.sig, stride);
+    entry.offset = offset;
+
+    // Uniform stride gets priority, but only once the counter is saturated.
+    // A short run of equal strides inside a longer pattern (the +2,+2,+2 in
+    // +1,+2,+2,+2,+3) never gets there, so it stays with the pattern table.
+    if (entry.conf == CONF_MAX) {
+        for (int i = 1; i <= degree; i++) {
+            uint64_t pf_line = line + (int64_t)i * stride;
+            if (!same_page(line, pf_line) || !issue(this, ip, addr, pf_line, uniform_issued))
+                break;
+        }
+        return;
+    }
+
+    // Non-uniform: predict the next stride from the signature, then update a
+    // copy of the signature with that prediction to look one more step ahead.
+    uint16_t sig = entry.sig;
+    uint64_t pf_line = line;
+    for (int i = 0; i < degree; i++) {
+        PTEntry &next = pattern_table[sig];
+        if (next.conf < PT_THRESHOLD)
+            break;
+
+        pf_line += next.stride;
+        if (!same_page(line, pf_line) || !issue(this, ip, addr, pf_line, pattern_issued))
+            break;
+
+        sig = next_signature(sig, next.stride);
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    std::cout << "CPU " << cpu << " SPP final stats (whole run, warmup included)" << std::endl;
+    std::cout << "Prefetches issued: " << total_issued
+              << "  uniform: " << uniform_issued
+              << "  pattern: " << pattern_issued << std::endl;
+    std::cout << "Useful (own checker): " << total_useful << "  accuracy: "
+              << (total_issued ? 100.0 * total_useful / total_issued : 0.0) << "%" << std::endl;
+    std::cout << "Windows at each degree:";
+    for (int d = 1; d <= MAX_DEGREE; d++)
+        std::cout << "  " << d << ": " << windows_at_degree[d];
+    std::cout << std::endl;
+    std::cout << "Final degree: " << degree << std::endl;
 }

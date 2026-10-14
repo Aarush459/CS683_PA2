@@ -1,0 +1,6 @@
+bin/
+obj/
+*.gz
+*.xz
+results.zip
+.DS_Store
