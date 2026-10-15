@@ -1,0 +1,117 @@
+// ============================================================
+// Task 2A: Instruction-Conscious RRIP (I-RRIP) for L2C
+// ============================================================
+// Design Rationale:
+//   Server workloads have large instruction footprints that exceed
+//   L1I cache capacity, making L2 instruction hits critical.
+//   Standard RRIP treats instruction and data lines equally.
+//
+//   I-RRIP prioritizes instruction lines by:
+//   - INSERTION:  Instruction lines inserted at RRPV=0 (MRU, highest priority)
+//                 Data lines inserted at RRPV=maxRRPV-1 (SRRIP-style)
+//   - PROMOTION:  Instruction hits promoted to RRPV=0 immediately
+//                 Data hits also promoted to RRPV=0 (standard RRIP)
+//   - EVICTION:   Among maxRRPV ways, prefer evicting data lines over
+//                 instruction lines when there is a tie
+//
+// This minimizes L2 instruction load MPKI while keeping good data
+// cache behavior for most workloads.
+// ============================================================
+
+#include "cache.h"
+
+#define maxRRPV 3
+
+// Per-set per-way RRPV storage
+uint32_t irrip_rrpv[L2C_SET][L2C_WAY];
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP (Instruction-Conscious RRIP) state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            irrip_rrpv[i][j] = maxRRPV; // cold start: all lines are distant re-reference
+        }
+    }
+}
+
+// find replacement victim
+// Enhancement: among ways at maxRRPV, prefer evicting DATA lines over instruction lines.
+// This gives instruction lines a "second chance" when tied with data lines.
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                 const BLOCK *current_set, uint64_t ip,
+                                 uint64_t full_addr, uint32_t type)
+{
+    // Phase 1: Look for maxRRPV DATA lines first (preferred eviction candidates)
+    while (1) {
+        // First pass: prefer to evict data lines at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (irrip_rrpv[set][i] == maxRRPV && !current_set[i].instruction) {
+                return i; // evict data line
+            }
+        }
+
+        // Second pass: evict instruction lines at maxRRPV (if no data lines found)
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (irrip_rrpv[set][i] == maxRRPV) {
+                return i; // evict instruction line (last resort)
+            }
+        }
+
+        // No maxRRPV line found — age all lines by 1
+        for (int i = 0; i < L2C_WAY; i++) {
+            irrip_rrpv[set][i]++;
+        }
+    }
+
+    // Should never reach here
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+// isInstruction: 1 if the line is an instruction fetch, 0 if data
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                          uint64_t full_addr, uint64_t ip,
+                                          uint64_t victim_addr, uint32_t type,
+                                          uint8_t hit, uint8_t isInstruction)
+{
+    // Skip writeback hits — they don't affect instruction/data access patterns
+    if ((type == WRITEBACK) && hit) {
+        return;
+    }
+
+    if (hit) {
+        // ---------------------------------------------------------------
+        // PROMOTION on cache hit
+        // Both instruction and data lines promoted to MRU (RRPV=0) on hit.
+        // Instruction lines benefit more: they were inserted at RRPV=0 too,
+        // so they consistently stay at the front of the eviction order.
+        // ---------------------------------------------------------------
+        irrip_rrpv[set][way] = 0;
+
+    } else {
+        // ---------------------------------------------------------------
+        // INSERTION on cache miss (new line being filled)
+        // Key distinction: instruction vs. data insertion priority
+        // ---------------------------------------------------------------
+        if (isInstruction) {
+            // Instruction miss: insert at RRPV=0 (highest priority, MRU)
+            // Rationale: Instruction lines are critical for frontend performance
+            // on server workloads. Keeping them alive reduces stalls.
+            irrip_rrpv[set][way] = 0;
+        } else {
+            // Data miss: insert at RRPV=maxRRPV-1 (SRRIP-style, moderate priority)
+            // Rationale: Data lines may or may not be reused soon. Using SRRIP
+            // default insertion avoids thrashing while still giving them a chance.
+            irrip_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+}

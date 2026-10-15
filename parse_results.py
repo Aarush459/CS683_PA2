@@ -32,7 +32,14 @@ import sys
 
 NUM = r"([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?|-?nan|-?inf)"
 
-DISPLAY = {"baseline": "Baseline", "ip_stride": "IP-stride", "spp": "SPP"}
+DISPLAY = {
+    "baseline": "Baseline",
+    "ip_stride": "IP-stride",
+    "spp": "SPP",
+    "irrip": "I-RRIP",
+    "dyn_irrip": "Dyn-IRRIP",
+    "task3": "SPP+Dyn-IRRIP"
+}
 
 
 def label(cfg):
@@ -180,11 +187,11 @@ def make_plots(out_dir, traces, configs, data):
             out.append(0.0 if (v is None or math.isnan(v)) else v)
         return out
 
-    blues = ["#6a7fb8", "#93abc6", "#3b5a8c", "#b7c7dc"]
-    mpki_colors = ["lightcoral", "skyblue", "lightgreen", "khaki"]
+    blues = ["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974", "#64b5cd", "#8c564b"]
+    mpki_colors = ["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974", "#64b5cd", "#8c564b"]
 
     # Speedup over baseline
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
     vals = {c: series(c, "speedup") for c in others}
     grouped_bars(ax, traces, others, vals, blues, fmt="%.4f")
     ax.axhline(1.0, color="brown", linestyle="--", linewidth=1, label="Baseline")
@@ -193,14 +200,14 @@ def make_plots(out_dir, traces, configs, data):
     pad = max((max(allv) - min(allv)) * 0.5, 0.002)
     ax.set_ylim(min(allv) - pad, max(allv) + pad)
     ax.set_ylabel("Speedup")
-    ax.set_title("Speedup of L1D Prefetchers over Baseline (no prefetching)")
+    ax.set_title("Speedup over Baseline (no prefetching, LRU replacement)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "speedup.png"), dpi=150)
     plt.close(fig)
 
     # L1D load MPKI (baseline included)
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
     vals = {c: series(c, "l1d_load_mpki") for c in configs}
     grouped_bars(ax, traces, configs, vals, mpki_colors)
     ax.set_ylabel("L1D Load MPKI")
@@ -211,12 +218,37 @@ def make_plots(out_dir, traces, configs, data):
     fig.savefig(os.path.join(out_dir, "l1d_load_mpki.png"), dpi=150)
     plt.close(fig)
 
+    # L2C Total Load MPKI
+    if any(c in configs for c in ["irrip", "dyn_irrip", "task3"]):
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        vals = {c: series(c, "l2c_load_mpki") for c in configs}
+        grouped_bars(ax, traces, configs, vals, mpki_colors)
+        ax.set_ylabel("L2C Load MPKI")
+        ax.set_xlabel("Traces")
+        ax.set_title("L2C Total Load MPKI Comparison")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "l2c_load_mpki.png"), dpi=150)
+        plt.close(fig)
+
+        # L2C Instruction Load MPKI
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        vals = {c: series(c, "l2c_instr_load_mpki") for c in configs}
+        grouped_bars(ax, traces, configs, vals, mpki_colors)
+        ax.set_ylabel("L2C Instruction Load MPKI")
+        ax.set_xlabel("Traces")
+        ax.set_title("L2C Instruction Load MPKI (Task 2 Target)")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "l2c_instr_load_mpki.png"), dpi=150)
+        plt.close(fig)
+
     # Accuracy and coverage (prefetching configs only).
     # ChampSim prints ACCURACY already as a percentage
     # (= USEFUL LOAD PREFETCHES / PREFETCH ISSUED TO LOWER LEVEL * 100).
     for key, ylabel, fname in [("accuracy", "L1D Prefetch Accuracy (%)", "accuracy.png"),
-                               ("coverage_pct", "L1D Prefetch Coverage (%)", "coverage.png")]:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
+                                ("coverage_pct", "L1D Prefetch Coverage (%)", "coverage.png")]:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
         vals = {c: series(c, key) for c in others}
         grouped_bars(ax, traces, others, vals, blues)
         ax.set_ylabel(ylabel)

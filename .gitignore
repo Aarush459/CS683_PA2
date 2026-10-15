@@ -2,5 +2,11 @@ bin/
 obj/
 *.gz
 *.xz
+*.champsimtrace.*
+traces/
 results.zip
 .DS_Store
+__pycache__/
+*.o
+*.d
+

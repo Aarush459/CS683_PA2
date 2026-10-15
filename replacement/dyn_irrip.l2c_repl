@@ -1,0 +1,224 @@
+// =====================================================================
+// Task 2B & Task 3: Dynamic I-RRIP with Set-Dueling & Prefetch Awareness
+// =====================================================================
+// Design Rationale:
+//
+// 1. Task 2B — Set-Dueling Dynamic I-RRIP:
+//    - Blindly prioritizing instruction lines over data lines can increase
+//      data misses during data-heavy phases.
+//    - We designate 32 "leader sets" (spaced across the 1024 L2 sets) that
+//      ALWAYS execute the standard baseline RRIP policy.
+//    - On these leader sets, we track instruction accesses & misses vs. total:
+//        ratio = (instr_accesses + instr_misses) / (total_accesses + total_misses)
+//    - If ratio > DYN_THRESHOLD (default 0.25), instruction traffic is high,
+//      so the follower sets switch to I-RRIP mode. Otherwise, they use RRIP mode.
+//
+// 2. Task 3 — SPP Prefetch Awareness:
+//    - SPP brings speculative data lines into L2. If treated equally with
+//      demand lines, inaccurate prefetches pollute the cache and evict critical
+//      instruction lines.
+//    - We check (type == PREFETCH):
+//        * Insertion (miss): Prefetch lines are inserted at RRPV = maxRRPV (3).
+//          If unused, they will be evicted first before any demand line!
+//        * Hit (useful promotion): If a demand access hits a prefetched line,
+//          it gets promoted to RRPV = 0 (validated as useful).
+//        * Eviction: Among lines at maxRRPV, the victim selection orders:
+//          1) Prefetch lines (evicted first)
+//          2) Data demand lines
+//          3) Instruction lines (highest retention priority)
+//
+// This unified replacement policy achieves optimal performance for both
+// standalone execution (Task 2B) and prefetch-integrated execution (Task 3).
+// =====================================================================
+
+#include "cache.h"
+#include <cstring>
+
+#define DYN_MAX_RRPV     3      // 2-bit RRPV: values 0, 1, 2, 3
+#define NUM_LEADER_SETS  32     // 32 leader sets out of 1024 (~3.1% overhead)
+#define DYN_THRESHOLD 0.25
+
+// Per-set per-way RRPV storage
+static uint32_t dyn_rrpv[L2C_SET][L2C_WAY];
+
+// Leader set bitmap
+static bool dyn_is_leader[L2C_SET];
+
+// Set-dueling counters on leader sets
+static uint64_t dyn_total_accesses = 0;
+static uint64_t dyn_instr_accesses = 0;
+static uint64_t dyn_total_misses   = 0;
+static uint64_t dyn_instr_misses   = 0;
+
+// Current global operating mode (true = I-RRIP, false = RRIP)
+static bool dyn_use_irrip = false;
+
+// Task 3: Prefetch awareness counters for verification
+static uint64_t dyn_pf_inserted = 0;
+static uint64_t dyn_pf_hit_promoted = 0;
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "------------------------------------------------------------" << endl;
+    cout << " Initialize Dynamic I-RRIP with Set-Dueling & Prefetch-Awareness " << endl;
+    cout << " Leader sets: " << NUM_LEADER_SETS
+         << " | Threshold: " << DYN_THRESHOLD << endl;
+    cout << "------------------------------------------------------------" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            dyn_rrpv[i][j] = DYN_MAX_RRPV; // Cold lines initialized to maxRRPV
+        }
+    }
+
+    // Leader sets are distributed uniformly across the 1024 sets
+    memset(dyn_is_leader, false, sizeof(dyn_is_leader));
+    int step = L2C_SET / NUM_LEADER_SETS; // 1024 / 32 = 32
+    for (int i = 0; i < NUM_LEADER_SETS; i++) {
+        dyn_is_leader[i * step] = true;
+    }
+
+    dyn_total_accesses = 0;
+    dyn_instr_accesses = 0;
+    dyn_total_misses   = 0;
+    dyn_instr_misses   = 0;
+    dyn_use_irrip      = false;
+
+    dyn_pf_inserted     = 0;
+    dyn_pf_hit_promoted = 0;
+}
+
+// Victim selection
+// In I-RRIP mode: among maxRRPV lines, evict prefetch lines first, then data, lastly instructions.
+// In RRIP mode (and for leader sets): evict the first maxRRPV line encountered.
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                 const BLOCK *current_set, uint64_t ip,
+                                 uint64_t full_addr, uint32_t type)
+{
+    bool irrip_active = dyn_use_irrip && !dyn_is_leader[set];
+
+    while (1) {
+        if (irrip_active) {
+            // Priority 1: Evict maxRRPV prefetch lines first (Task 3: prevent pollution)
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (dyn_rrpv[set][i] == DYN_MAX_RRPV && current_set[i].prefetch) {
+                    return i;
+                }
+            }
+            // Priority 2: Evict maxRRPV non-instruction (data) lines
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (dyn_rrpv[set][i] == DYN_MAX_RRPV && !current_set[i].instruction) {
+                    return i;
+                }
+            }
+            // Priority 3: Evict any maxRRPV line (instruction lines as last resort)
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (dyn_rrpv[set][i] == DYN_MAX_RRPV) {
+                    return i;
+                }
+            }
+        } else {
+            // Standard RRIP victim selection
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (dyn_rrpv[set][i] == DYN_MAX_RRPV) {
+                    return i;
+                }
+            }
+        }
+
+        // Aging pass: increment all RRPVs until at least one hits maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            dyn_rrpv[set][i]++;
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+// Update replacement state on cache hit or cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                          uint64_t full_addr, uint64_t ip,
+                                          uint64_t victim_addr, uint32_t type,
+                                          uint8_t hit, uint8_t isInstruction)
+{
+    // Writeback hits don't affect replacement policy order
+    if ((type == WRITEBACK) && hit)
+        return;
+
+    bool is_prefetch = (type == PREFETCH || type == PREFETCH_TRANSLATION);
+
+    // -----------------------------------------------------------------
+    // 1. Leader Set Tracking & Set-Dueling Decision Logic
+    // -----------------------------------------------------------------
+    if (dyn_is_leader[set]) {
+        dyn_total_accesses++;
+        if (isInstruction)
+            dyn_instr_accesses++;
+
+        if (!hit) {
+            dyn_total_misses++;
+            if (isInstruction)
+                dyn_instr_misses++;
+        }
+
+        // Recalculate instruction activity ratio
+        uint64_t total = dyn_total_accesses + dyn_total_misses;
+        if (total > 0) {
+            double ratio = (double)(dyn_instr_accesses + dyn_instr_misses) / (double)total;
+            dyn_use_irrip = (ratio > DYN_THRESHOLD);
+        }
+    }
+
+    // Leader sets always execute standard RRIP policy
+    bool irrip_active = dyn_use_irrip && !dyn_is_leader[set];
+
+    // -----------------------------------------------------------------
+    // 2. Promotion & Insertion Logic
+    // -----------------------------------------------------------------
+    if (hit) {
+        // PROMOTION on hit
+        if (is_prefetch) {
+            // Hit by a prefetch packet: moderate promotion so it doesn't displace demand
+            dyn_rrpv[set][way] = (dyn_rrpv[set][way] > 0) ? (dyn_rrpv[set][way] - 1) : 0;
+        } else {
+            // Demand hit (instruction or data): promote to MRU (RRPV = 0)
+            dyn_rrpv[set][way] = 0;
+            dyn_pf_hit_promoted++;
+        }
+    } else {
+        // INSERTION on miss
+        if (is_prefetch) {
+            // Task 3: Prefetched lines are speculative.
+            // Insert at maxRRPV (3) so unused prefetches are discarded first.
+            dyn_rrpv[set][way] = DYN_MAX_RRPV;
+            dyn_pf_inserted++;
+        } else if (irrip_active && isInstruction) {
+            // Task 2B (I-RRIP mode): prioritize instruction lines at MRU (0)
+            dyn_rrpv[set][way] = 0;
+        } else {
+            // Data line or plain RRIP mode: SRRIP default insertion (maxRRPV - 1 = 2)
+            dyn_rrpv[set][way] = DYN_MAX_RRPV - 1;
+        }
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t total = dyn_total_accesses + dyn_total_misses;
+    double ratio = (total > 0) ?
+        (double)(dyn_instr_accesses + dyn_instr_misses) / (double)total : 0.0;
+
+    cout << "\n============================================================" << endl;
+    cout << "           Dynamic I-RRIP Final Simulation Stats            " << endl;
+    cout << "============================================================" << endl;
+    cout << "Leader set accesses:       " << dyn_total_accesses << endl;
+    cout << "Leader set misses:         " << dyn_total_misses << endl;
+    cout << "Leader set instr accesses: " << dyn_instr_accesses << endl;
+    cout << "Leader set instr misses:   " << dyn_instr_misses << endl;
+    cout << "Observed instr ratio:      " << ratio << " (Threshold: " << DYN_THRESHOLD << ")" << endl;
+    cout << "Final operating mode:      " << (dyn_use_irrip ? "I-RRIP" : "RRIP") << endl;
+    cout << "Prefetch lines inserted:   " << dyn_pf_inserted << endl;
+    cout << "Demand hits on prefetches: " << dyn_pf_hit_promoted << endl;
+    cout << "============================================================\n" << endl;
+}
